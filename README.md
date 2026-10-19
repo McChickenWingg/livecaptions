@@ -123,6 +123,3 @@ Python, Tkinter, [Vosk](https://alphacephei.com/vosk/) (speech recognition and s
 ## Credits
 
 Speech and speaker models are provided by the Vosk project (Alpha Cephei) under their own licences. See the Vosk site for details.
-
-Co-authored-by: Claude <noreply@anthropic.com>
-
