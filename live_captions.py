@@ -13,6 +13,7 @@ First run downloads two small models (~55 MB) to %APPDATA%\\LiveCaptions.
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -55,8 +56,17 @@ SPK_MODEL = (
 
 TARGET_RATE = 16000
 MAX_SPEAKERS = 8
-MIN_WORDS_FOR_RELIABLE_VOICEPRINT = 3
-DEFAULT_SPLIT_THRESHOLD = 0.40  # cosine distance; lower = splits voices more eagerly
+# Speaker matching quality controls
+MIN_FRAMES_LEARN = 100      # ~1 s of speech before a sentence may refine a voiceprint
+MIN_FRAMES_CREATE = 150     # ~1.5 s of speech before a sentence may start a new speaker
+MIN_WORDS_LEARN = 4         # fallback if the recogniser gives no frame count
+MIN_WORDS_CREATE = 6
+AMBIGUITY_MARGIN = 0.06     # don't learn from sentences that fit two speakers about equally
+FAR_MARGIN = 0.12           # beyond threshold + this, a voice is clearly someone new
+MERGE_FACTOR = 0.70         # speakers closer than threshold * this get merged
+LEARN_CAP = 12              # old samples count at most this much (voiceprints keep adapting)
+
+DEFAULT_SPLIT_THRESHOLD = 0.50  # cosine distance; lower = splits voices more eagerly
 
 SPEAKER_COLOURS = [
     "#4FC3F7",  # blue
@@ -68,6 +78,14 @@ SPEAKER_COLOURS = [
     "#4DB6AC",  # teal
     "#E57373",  # red
 ]
+
+# How speakers are shown
+SPEAKER_MODES = {
+    "Colours & labels": "labels",
+    "Show >>> when speaker changes": "arrows",
+    "Off (one box)": "off",
+}
+MARKER_COLOUR = "#FFB74D"
 
 BG = "#15171c"
 PANEL = "#1e2128"
@@ -101,19 +119,72 @@ def ensure_model(name_url, status_cb):
 
 
 # --------------------------------------------------------------------------
+# Simple rule-based punctuation (no extra models needed)
+# --------------------------------------------------------------------------
+_QUESTION_STARTERS = {
+    "who", "what", "when", "where", "why", "how", "which", "whose", "whom",
+    "is", "are", "am", "was", "were", "do", "does", "did", "can", "could",
+    "will", "would", "should", "isn't", "aren't", "don't", "doesn't", "didn't",
+    "can't", "won't", "wouldn't", "couldn't", "shouldn't",
+}
+_OPENERS = {
+    "yes", "yeah", "no", "well", "okay", "ok", "so", "anyway", "however",
+    "actually", "honestly", "basically", "hello", "hi", "hey", "right",
+    "sure", "alright", "also", "meanwhile", "therefore",
+}
+
+
+def punctuate(text):
+    """Capitalise, fix 'I', add commas after openers / before 'but', end with . or ?"""
+    t = " ".join(text.split())
+    if not t:
+        return t
+    t = re.sub(r"\bi\b", "I", t)
+    words = t.split()
+
+    first = words[0].lower()
+    if len(words) > 2 and first in _OPENERS:
+        words[0] += ","
+        first = words[1].lower()  # judge "question or not" from the word after the opener
+    for i in range(3, len(words)):
+        if words[i].lower() == "but" and not words[i - 1].endswith(","):
+            words[i - 1] += ","
+
+    t = " ".join(words)
+    t = t[0].upper() + t[1:]
+    if t[-1] not in ".?!":
+        t += "?" if (first in _QUESTION_STARTERS and len(words) >= 2) else "."
+    return t
+
+
+# --------------------------------------------------------------------------
 # Speaker tracking (online clustering of Vosk x-vectors)
 # --------------------------------------------------------------------------
 class SpeakerTracker:
+    """Online speaker clustering over Vosk voiceprints (x-vectors).
+
+    Tuned to avoid the two classic problems:
+      * voiceprints getting polluted - a speaker's stored voiceprint is only
+        refined by sentences that are long enough AND clearly match that speaker
+        and no one else;
+      * too many speakers - a new speaker needs a long sentence that is clearly
+        different, or two consistent "maybe new" sentences in a row. Speakers
+        whose voiceprints drift together are merged.
+    """
+
     def __init__(self):
         self.lock = threading.Lock()
         self.threshold = DEFAULT_SPLIT_THRESHOLD
+        self.enabled = True  # False = single box, no speaker detection
         self.reset()
 
     def reset(self):
         with self.lock:
-            self.centroids = []
-            self.counts = []
+            self.centroids = {}   # speaker id -> unit voiceprint
+            self.counts = {}      # speaker id -> confident samples so far
+            self.next_id = 0
             self.last = 0
+            self.pending = None   # voiceprint of an unconfirmed "maybe new" sentence
 
     @staticmethod
     def _unit(vec):
@@ -121,42 +192,96 @@ class SpeakerTracker:
         n = np.linalg.norm(v)
         return v / n if n > 0 else v
 
-    def assign(self, vec, reliable):
-        """Return a speaker index for this utterance."""
+    @staticmethod
+    def _dist(a, b):
+        return 1.0 - float(np.dot(a, b))
+
+    def _create(self, v):
+        sid = self.next_id
+        self.next_id += 1
+        self.centroids[sid] = v
+        self.counts[sid] = 1
+        self.last = sid
+        self.pending = None
+        return sid
+
+    def _learn(self, sid, v):
+        n = min(self.counts[sid], LEARN_CAP)
+        self.centroids[sid] = self._unit((self.centroids[sid] * n + v) / (n + 1))
+        self.counts[sid] += 1
+
+    def _merge_close(self):
+        """Merge speakers whose voiceprints have drifted together."""
+        merge_thr = self.threshold * MERGE_FACTOR
+        merged = True
+        while merged:
+            merged = False
+            ids = sorted(self.centroids)
+            for x in range(len(ids)):
+                for y in range(x + 1, len(ids)):
+                    i, j = ids[x], ids[y]
+                    if self._dist(self.centroids[i], self.centroids[j]) < merge_thr:
+                        keep, drop = (i, j) if self.counts[i] >= self.counts[j] else (j, i)
+                        ck, cd = self.counts[keep], self.counts[drop]
+                        self.centroids[keep] = self._unit(
+                            self.centroids[keep] * ck + self.centroids[drop] * cd)
+                        self.counts[keep] = ck + cd
+                        del self.centroids[drop], self.counts[drop]
+                        if self.last == drop:
+                            self.last = keep
+                        merged = True
+                        break
+                if merged:
+                    break
+
+    def assign(self, vec, frames=0, words=0):
+        """Return a speaker number for one finished sentence.
+
+        frames: amount of speech the voiceprint was computed from (10 ms units)
+        words:  number of words recognised (used if frames is unavailable)
+        """
         with self.lock:
+            if not self.enabled:
+                return 0
             if vec is None:
                 return self.last
             v = self._unit(vec)
 
+            can_learn = frames >= MIN_FRAMES_LEARN or words >= MIN_WORDS_LEARN
+            can_create = frames >= MIN_FRAMES_CREATE or words >= MIN_WORDS_CREATE
+            thr = self.threshold
+
             if not self.centroids:
-                if not reliable:
-                    return 0
-                self.centroids.append(v)
-                self.counts.append(1)
-                self.last = 0
-                return 0
+                return self._create(v) if can_create else self.last
 
-            dists = [1.0 - float(np.dot(v, c)) for c in self.centroids]
-            best = int(np.argmin(dists))
+            ranked = sorted((self._dist(v, c), sid) for sid, c in self.centroids.items())
+            d1, best = ranked[0]
+            d2 = ranked[1][0] if len(ranked) > 1 else 9.9
 
-            if dists[best] < self.threshold:
-                if reliable:
-                    n = self.counts[best]
-                    c = (self.centroids[best] * n + v) / (n + 1)
-                    self.centroids[best] = self._unit(c)
-                    self.counts[best] = n + 1
+            # --- sounds like a known speaker ---
+            if d1 < thr:
+                self.pending = None
+                self.last = best
+                if can_learn and d1 < thr * 0.85 and (d2 - d1) >= AMBIGUITY_MARGIN:
+                    self._learn(best, v)
+                    self._merge_close()
+                return self.last
+
+            # --- sounds different from everyone ---
+            if can_create and len(self.centroids) < MAX_SPEAKERS:
+                if d1 > thr + FAR_MARGIN:
+                    return self._create(v)               # clearly someone new
+                if self.pending is not None and self._dist(v, self.pending) < thr * 0.9:
+                    return self._create(self._unit(v + self.pending))  # confirmed twice
+                self.pending = v                         # unsure: wait for a second sighting
                 self.last = best
                 return best
 
-            # Looks like a different voice
-            if reliable and len(self.centroids) < MAX_SPEAKERS:
-                self.centroids.append(v)
-                self.counts.append(1)
-                self.last = len(self.centroids) - 1
-                return self.last
-
-            # Too short to trust, or speaker limit hit: keep the previous speaker
-            return best if (reliable and len(self.centroids) >= MAX_SPEAKERS) else self.last
+            # too short to trust (or speaker limit reached): stay with the closest/last voice
+            if d1 < thr + FAR_MARGIN:
+                self.last = best
+                return best
+            return self.last
 
 
 # --------------------------------------------------------------------------
@@ -261,13 +386,11 @@ class CaptionEngine(threading.Thread):
     def _status(self, msg):
         self.ui_q.put(("status", msg))
 
-    def _emit_final(self, rec):
-        res = json.loads(rec.Result())
+    def _emit(self, res):
         text = res.get("text", "").strip()
         if text:
-            words = len(text.split())
             sid = self.tracker.assign(
-                res.get("spk"), reliable=words >= MIN_WORDS_FOR_RELIABLE_VOICEPRINT
+                res.get("spk"), frames=res.get("spk_frames", 0), words=len(text.split())
             )
             self.ui_q.put(("final", sid, text[0].upper() + text[1:]))
         self.ui_q.put(("partial", ""))
@@ -281,6 +404,13 @@ class CaptionEngine(threading.Thread):
             spk_model = SpkModel(spk_path)
             rec = KaldiRecognizer(model, TARGET_RATE)
             rec.SetSpkModel(spk_model)
+            try:
+                # end sentences after shorter pauses, so fewer sentences contain
+                # more than one person (only if this Vosk version supports it)
+                from vosk import EndpointerMode
+                rec.SetEndpointerMode(EndpointerMode.SHORT)
+            except Exception:
+                pass
         except Exception as exc:
             self.ui_q.put(("error", f"Could not load speech models:\n{exc}"))
             return
@@ -295,19 +425,14 @@ class CaptionEngine(threading.Thread):
 
             if data is None:  # flush request (capture stopped)
                 try:
-                    res = json.loads(rec.FinalResult())
-                    text = res.get("text", "").strip()
-                    if text:
-                        sid = self.tracker.assign(res.get("spk"), reliable=False)
-                        self.ui_q.put(("final", sid, text[0].upper() + text[1:]))
+                    self._emit(json.loads(rec.FinalResult()))
                 except Exception:
-                    pass
-                self.ui_q.put(("partial", ""))
+                    self.ui_q.put(("partial", ""))
                 last_partial = ""
                 continue
 
             if rec.AcceptWaveform(data):
-                self._emit_final(rec)
+                self._emit(json.loads(rec.Result()))
                 last_partial = ""
             else:
                 partial = json.loads(rec.PartialResult()).get("partial", "")
@@ -360,6 +485,8 @@ class CaptionOverlay:
                             takefocus=0)
         self.text.pack(fill="both", expand=True)
         self.text.tag_configure("partial", foreground=MUTED)
+        self.text.tag_configure("plain", foreground=FG)
+        self.text.tag_configure("marker", foreground=MARKER_COLOUR, font=self.bold)
         for i, colour in enumerate(SPEAKER_COLOURS):
             self.text.tag_configure(f"spk{i}", foreground=colour)
             self.text.tag_configure(f"lbl{i}", foreground=colour, font=self.bold)
@@ -441,18 +568,23 @@ class CaptionOverlay:
         if r:
             self.text.delete(r[0], r[-1])
 
-    def add_final(self, sid, text):
-        sid %= len(SPEAKER_COLOURS)
+    def add_final(self, sid, text, mode="labels"):
+        if mode != "off":
+            sid %= len(SPEAKER_COLOURS)
+        key = "plain" if mode == "off" else sid
 
         def do():
             self._remove_partial()
-            if sid != self.last_sid:
+            if key != self.last_sid:
                 if self.text.index("end-1c") != "1.0":
                     self.text.insert("end", "\n")
-                if self.show_names.get():
+                if mode == "labels" and self.show_names.get():
                     self.text.insert("end", f"Speaker {sid + 1}: ", (f"lbl{sid}",))
-                self.last_sid = sid
-            self.text.insert("end", text + " ", (f"spk{sid}",))
+                elif mode == "arrows" and self.last_sid is not None:
+                    self.text.insert("end", ">>> ", ("marker",))
+                self.last_sid = key
+            tag = f"spk{sid}" if mode == "labels" else "plain"
+            self.text.insert("end", text + " ", (tag,))
             if int(self.text.index("end-1c").split(".")[0]) > 300:
                 self.text.delete("1.0", "100.0")
 
@@ -489,7 +621,7 @@ class App:
         self.devices = []
         self.last_sid = None
         self.known_speakers = set()
-        self.transcript = []  # [(speaker_index, text)]
+        self.transcript = []  # [(speaker_index, text, display_mode)]
         self.models_ready = False
         self.overlay = None
 
@@ -559,13 +691,25 @@ class App:
         ttk.Label(row3, text="Voice separation", style="Muted.TLabel").pack(side="left")
         ttk.Label(row3, text="fewer", style="Muted.TLabel").pack(side="left", padx=(8, 2))
         self.thr_var = tk.DoubleVar(value=DEFAULT_SPLIT_THRESHOLD)
-        ttk.Scale(row3, from_=0.80, to=0.15, variable=self.thr_var, length=160,
-                  command=self.on_threshold).pack(side="left")
+        self.thr_scale = ttk.Scale(row3, from_=0.80, to=0.15, variable=self.thr_var,
+                                   length=160, command=self.on_threshold)
+        self.thr_scale.pack(side="left")
         ttk.Label(row3, text="more speakers", style="Muted.TLabel").pack(side="left", padx=(2, 16))
         ttk.Label(row3, text="Level", style="Muted.TLabel").pack(side="left")
         self.level_bar = ttk.Progressbar(row3, style="Level.Horizontal.TProgressbar",
                                          maximum=100, length=120)
         self.level_bar.pack(side="left", padx=8)
+
+        row4 = ttk.Frame(self.root, padding=(12, 2))
+        row4.pack(fill="x")
+        self.punct_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row4, text="Add punctuation", variable=self.punct_var).pack(side="left")
+        ttk.Label(row4, text="Speakers").pack(side="left", padx=(16, 4))
+        self.mode_var = tk.StringVar(value="Show >>> when speaker changes")
+        self.mode_box = ttk.Combobox(row4, textvariable=self.mode_var, state="readonly",
+                                     width=28, values=list(SPEAKER_MODES))
+        self.mode_box.pack(side="left")
+        self.mode_box.bind("<<ComboboxSelected>>", lambda e: self.on_mode_change())
 
         self.legend = ttk.Frame(self.root, padding=(12, 2))
         self.legend.pack(fill="x")
@@ -583,6 +727,8 @@ class App:
         self.text.pack(side="left", fill="both", expand=True)
 
         self.text.tag_configure("partial", foreground=MUTED)
+        self.text.tag_configure("plain", foreground=FG)
+        self.text.tag_configure("marker", foreground=MARKER_COLOUR, font=self.bold_font)
         for i, colour in enumerate(SPEAKER_COLOURS):
             self.text.tag_configure(f"spk{i}", foreground=colour)
             self.text.tag_configure(f"lbl{i}", foreground=colour, font=self.bold_font)
@@ -636,6 +782,27 @@ class App:
         self.level_bar["value"] = 0
         self.status_var.set("Stopped.")
 
+    def speaker_mode(self):
+        return SPEAKER_MODES.get(self.mode_var.get(), "labels")
+
+    def on_mode_change(self):
+        mode = self.speaker_mode()
+        on = mode != "off"
+        self.tracker.enabled = on
+        self.thr_scale.state(["!disabled"] if on else ["disabled"])
+        self.last_sid = None  # the next caption starts a fresh line
+        if self.overlay:
+            self.overlay.last_sid = None
+        self.known_speakers.clear()
+        for w in self.legend.winfo_children():
+            w.destroy()
+        self.status_var.set({
+            "labels": "Speakers shown with colours and labels.",
+            "arrows": "A >>> marks each time a different person speaks.",
+            "off": "Speaker identification off - all captions show in one box.",
+        }[mode])
+        self.mode_box.selection_clear()
+
     def on_threshold(self, _value):
         self.tracker.threshold = float(self.thr_var.get())
 
@@ -664,8 +831,8 @@ class App:
             self.overlay.close()
             return
         self.overlay = CaptionOverlay(self.root, self._overlay_closed)
-        for sid, text in self.transcript[-8:]:  # catch up on recent captions
-            self.overlay.add_final(sid, text)
+        for sid, text, mode in self.transcript[-8:]:  # catch up on recent captions
+            self.overlay.add_final(sid, text, mode)
         self.pop_btn.configure(text="Close pop-out")
 
     def _overlay_closed(self):
@@ -681,11 +848,18 @@ class App:
             initialfile=time.strftime("captions_%Y-%m-%d_%H-%M.txt"))
         if not path:
             return
-        lines, prev = [], None
-        for sid, text in self.transcript:
-            if sid != prev:
-                lines.append(f"\nSpeaker {sid + 1}: {text}")
-                prev = sid
+        lines, prev = [], None  # prev = (mode, speaker)
+        for sid, text, mode in self.transcript:
+            key = (mode, None if mode == "off" else sid)
+            if key != prev:
+                if mode == "labels":
+                    label = f"Speaker {sid + 1}: "
+                elif mode == "arrows" and prev is not None and prev[0] == "arrows":
+                    label = ">>> "
+                else:
+                    label = ""
+                lines.append(f"\n{label}{text}")
+                prev = key
             else:
                 lines[-1] += " " + text
         with open(path, "w", encoding="utf-8") as f:
@@ -714,23 +888,35 @@ class App:
                  font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 14))
 
     def add_final(self, sid, text):
-        sid %= len(SPEAKER_COLOURS)
-        self._add_legend(sid)
-        self.transcript.append((sid, text))
+        if self.punct_var.get():
+            text = punctuate(text)
+        mode = self.speaker_mode()
+        if mode == "off":
+            sid, key = None, "plain"
+        else:
+            sid %= len(SPEAKER_COLOURS)
+            key = sid
+        if mode == "labels":
+            self._add_legend(sid)
+        self.transcript.append((sid, text, mode))
 
         def do():
             self._remove_partial()
-            if sid != self.last_sid:
+            if key != self.last_sid:
                 if self.text.index("end-1c") != "1.0":
                     self.text.insert("end", "\n")
-                self.text.insert("end", f"Speaker {sid + 1}: ", (f"lbl{sid}",))
-                self.last_sid = sid
-            self.text.insert("end", text + " ", (f"spk{sid}",))
+                if mode == "labels":
+                    self.text.insert("end", f"Speaker {sid + 1}: ", (f"lbl{sid}",))
+                elif mode == "arrows" and self.last_sid is not None:
+                    self.text.insert("end", ">>> ", ("marker",))
+                self.last_sid = key
+            tag = f"spk{sid}" if mode == "labels" else "plain"
+            self.text.insert("end", text + " ", (tag,))
 
         self._text_edit(do)
         self.text.see("end")
         if self.overlay:
-            self.overlay.add_final(sid, text)
+            self.overlay.add_final(sid, text, mode)
 
     def set_partial(self, text):
         def do():

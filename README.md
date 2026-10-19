@@ -10,8 +10,11 @@ Speech recognition runs entirely on your computer using [Vosk](https://alphaceph
 
 - Live English captions from **system audio** or a **microphone**
 - Captions appear only when speech is detected: grey while words are being recognised, then settling into the speaker's colour
-- **Colour-coded speakers** (up to 8) with "Speaker 1, 2, 3…" labels and a legend
+- **Speaker changes marked with `>>>`** (the default): a new line starting with `>>>` each time a different person speaks, and no marker while the same person carries on
+- Optional **colour-coded speakers** (up to 8) with "Speaker 1, 2, 3…" labels and a legend
 - Adjustable **voice separation** slider to control how readily voices are split
+- Optional **punctuation** (capital letters, commas, full stops and question marks)
+- **One-box mode**: turn off speaker identification to show all text together in one colour, with no markers or labels
 - **Pop-out window**: borderless, always on top, draggable, resizable, with adjustable text size and transparency, and optional speaker names
 - Audio level meter, font size controls, clear and reset buttons
 - Save the transcript to a text file with speaker labels
@@ -50,13 +53,39 @@ The first launch downloads two small speech models to `%APPDATA%\LiveCaptions\mo
 | Options | Right-click: text size, transparency, show/hide speaker names, clear, close |
 | Close | Click ✕, or press **Close pop-out** in the main window |
 
+### Punctuation
+
+Tick **Add punctuation** to tidy each caption: it capitalises the first word and the word "I", adds commas after openers such as "well" or "so" and before "but", and ends the sentence with a full stop or question mark. It uses simple rules rather than an AI model, so it is only a guide. For example, it treats any sentence starting with a word like "what", "how" or "is" as a question, and it never adds exclamation marks or most commas. The setting applies to new captions, including the pop-out and saved transcripts.
+
+### Showing speakers
+
+The **Speakers** dropdown chooses how speaker changes are shown. It applies to new captions, the pop-out window and saved transcripts.
+
+| Option | What you see |
+| --- | --- |
+| **Show >>> when speaker changes** (default) | All text in one colour. When a different person starts speaking, their words begin on a new line with `>>>` in front. While the same person keeps talking, no marker is added. |
+| **Colours & labels** | Each speaker gets their own colour and a "Speaker N:" label, with a colour legend. |
+| **Off (one box)** | Speaker detection is switched off. All captions flow together in one box, with no markers, labels or line breaks between people. |
+
+Example with `>>>`:
+
+```
+Hello there, how are you?
+>>> I'm fine thanks, and you?
+>>> Great.
+```
+
 ### Voice separation
 
-The slider sets how different two voices must sound before they're treated as separate speakers.
+The slider sets how different two voices must sound before they're treated as separate speakers. The default is 0.50.
 
 - If two people are merged into one colour, move the slider toward **more speakers**.
 - If one person is split into several colours, move it toward **fewer**.
 - **Reset voices** clears everything the app has learned, which is useful when a new conversation begins.
+
+To avoid too many speakers appearing, the app is cautious about learning and creating voices. A speaker's stored voice is only refined by sentences that are long enough and clearly match just that speaker. A new speaker needs a long sentence that sounds clearly different, or two similar-sounding "maybe new" sentences in a row. Speakers whose voices drift together are merged. The trade-off is that a genuinely new person's very first sentence may be labelled as the previous speaker. Very short sentences (a few words) are always attributed to the nearest or previous speaker, because their voiceprints are unreliable.
+
+If you still see too many speakers, raise the slider value (toward **fewer**). If different people are being merged, lower it.
 
 ## Building a standalone .exe
 
@@ -82,9 +111,9 @@ The app uses Vosk's small English model for speed. To trade speed for accuracy, 
 ## Limitations
 
 - English only
-- No automatic punctuation
-- Speaker detection is approximate. Similar-sounding voices can be merged, and phrases shorter than 3 words are attributed to the previous speaker
-- Overlapping speech is captioned as a single stream
+- Punctuation is rule-based and optional, not AI-generated
+- Speaker detection is approximate. Similar-sounding voices can be merged, and very short sentences are attributed to the nearest or previous speaker
+- People talking at the same time, or straight after each other with no pause, are captioned as one sentence under one speaker
 - System audio capture works with Windows output devices that support WASAPI loopback
 
 ## Built with
